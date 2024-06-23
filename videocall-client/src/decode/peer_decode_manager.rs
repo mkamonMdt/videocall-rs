@@ -2,8 +2,10 @@ use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
 use log::debug;
 use protobuf::Message;
 use std::{fmt::Display, sync::Arc};
+use types::protos::media_management_packet::{
+    media_management_packet::EventType, MediaManagementPacket,
+};
 use types::protos::media_packet::MediaPacket;
-use types::protos::packet_wrapper::packet_wrapper::PacketType;
 use types::protos::{media_packet::media_packet::MediaType, packet_wrapper::PacketWrapper};
 use yew::prelude::Callback;
 
@@ -20,7 +22,7 @@ pub enum PeerDecodeError {
     VideoDecodeError,
     NoSuchPeer(String),
     NoMediaType,
-    NoPacketType,
+    NoMediaManagementType,
     PacketParseError,
 }
 
@@ -40,7 +42,7 @@ impl Display for PeerDecodeError {
             PeerDecodeError::VideoDecodeError => write!(f, "VideoDecodeError"),
             PeerDecodeError::NoSuchPeer(s) => write!(f, "Peer Not Found: {s}"),
             PeerDecodeError::NoMediaType => write!(f, "No media_type"),
-            PeerDecodeError::NoPacketType => write!(f, "No packet_type"),
+            PeerDecodeError::NoMediaManagementType => write!(f, "No media_management_type"),
             PeerDecodeError::PacketParseError => {
                 write!(f, "Failed to parse to protobuf MediaPacket")
             }
@@ -99,28 +101,11 @@ impl Peer {
         self.screen = screen;
     }
 
-    fn decode(
+    fn decode_media_packet(
         &mut self,
-        packet: &Arc<PacketWrapper>,
+        packet: PacketWrapper,
     ) -> Result<(MediaType, DecodeStatus), PeerDecodeError> {
-        let packet_type = packet
-            .packet_type
-            .enum_value()
-            .map_err(|_| PeerDecodeError::NoPacketType)?;
-        if packet_type != PacketType::MEDIA_OPTIONAL && packet_type != PacketType::MEDIA_MANDATORY {
-            return Err(PeerDecodeError::IncorrectPacketType);
-        }
-
-        let packet = match self.aes {
-            Some(aes) => {
-                let data = aes
-                    .decrypt(&packet.data)
-                    .map_err(|_| PeerDecodeError::AesDecryptError)?;
-                parse_media_packet(&data)?
-            }
-            None => parse_media_packet(&packet.data)?,
-        };
-
+        let packet = Arc::new(decrypt_packet::<MediaPacket>(&self.aes, &packet.data)?);
         let media_type = packet
             .media_type
             .enum_value()
@@ -154,6 +139,22 @@ impl Peer {
         }
     }
 
+    fn decode_media_management_packet(
+        &mut self,
+        packet: PacketWrapper,
+    ) -> Result<String, PeerDecodeError> {
+        let packet = decrypt_packet::<MediaManagementPacket>(&self.aes, &packet.data)?;
+        let management_type = packet
+            .event_type
+            .enum_value()
+            .map_err(|_| PeerDecodeError::NoMediaManagementType)?;
+
+        match management_type {
+            EventType::ONGOING_STREAM => Ok(packet.email),
+            _ => Err(PeerDecodeError::IncorrectPacketType),
+        }
+    }
+
     fn on_heartbeat(&mut self) {
         self.heartbeat_count += 1;
     }
@@ -171,10 +172,23 @@ impl Peer {
     }
 }
 
-fn parse_media_packet(data: &[u8]) -> Result<Arc<MediaPacket>, PeerDecodeError> {
-    Ok(Arc::new(
-        MediaPacket::parse_from_bytes(data).map_err(|_| PeerDecodeError::PacketParseError)?,
-    ))
+fn decrypt_packet<T: Message>(
+    aes: &Option<Aes128State>,
+    data: &[u8],
+) -> Result<T, PeerDecodeError> {
+    match aes {
+        Some(aes) => {
+            let data = aes
+                .decrypt(data)
+                .map_err(|_| PeerDecodeError::AesDecryptError)?;
+            parse_packet::<T>(&data)
+        }
+        None => parse_packet::<T>(data),
+    }
+}
+
+fn parse_packet<T: Message>(data: &[u8]) -> Result<T, PeerDecodeError> {
+    T::parse_from_bytes(data).map_err(|_| PeerDecodeError::PacketParseError)
 }
 
 #[derive(Debug)]
@@ -208,18 +222,17 @@ impl PeerDecodeManager {
         self.connected_peers.remove_if(pred);
     }
 
-    pub fn decode(&mut self, response: PacketWrapper) -> Result<(), PeerDecodeError> {
-        let packet = Arc::new(response);
+    pub fn decode_media_packet(&mut self, packet: PacketWrapper) -> Result<(), PeerDecodeError> {
         let email = packet.email.clone();
         if let Some(peer) = self.connected_peers.get_mut(&email) {
-            match peer.decode(&packet) {
+            match peer.decode_media_packet(packet) {
                 Ok((MediaType::HEARTBEAT, _)) => {
                     peer.on_heartbeat();
                     Ok(())
                 }
                 Ok((media_type, decode_status)) => {
                     if decode_status.first_frame {
-                        self.on_first_frame.emit((email.clone(), media_type));
+                        self.on_first_frame.emit((email, media_type));
                     }
                     Ok(())
                 }
@@ -229,7 +242,18 @@ impl PeerDecodeManager {
                 }
             }
         } else {
-            Err(PeerDecodeError::NoSuchPeer(email.clone()))
+            Err(PeerDecodeError::NoSuchPeer(email))
+        }
+    }
+
+    pub fn decode_media_management_packet(
+        &mut self,
+        packet: PacketWrapper,
+    ) -> Result<String, PeerDecodeError> {
+        if let Some(peer) = self.connected_peers.get_mut(&packet.email) {
+            peer.decode_media_management_packet(packet)
+        } else {
+            Err(PeerDecodeError::NoSuchPeer(packet.email))
         }
     }
 

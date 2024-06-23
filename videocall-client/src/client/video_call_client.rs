@@ -336,7 +336,7 @@ impl Inner {
             }
             Ok(PacketType::MEDIA_OPTIONAL) | Ok(PacketType::MEDIA_MANDATORY) => {
                 let email = response.email.clone();
-                if let Err(e) = self.peer_decode_manager.decode(response) {
+                if let Err(e) = self.peer_decode_manager.decode_media_packet(response) {
                     error!("error decoding packet: {}", e.to_string());
                     self.peer_decode_manager.delete_peer(&email);
                 }
@@ -345,7 +345,14 @@ impl Inner {
                 error!("Not implemented: CONNECTION packet type");
             }
             Ok(PacketType::MEDIA_MANAGEMENT) => {
-                error!("Not implemented: MEDIA_MANAGEMENT packet type");
+                let email = response.email.clone();
+                if let Err(e) = self
+                    .peer_decode_manager
+                    .decode_media_management_packet(response)
+                {
+                    error!("error decoding packet: {}", e.to_string());
+                    self.peer_decode_manager.delete_peer(&email);
+                }
             }
             Err(_) => {}
         }
