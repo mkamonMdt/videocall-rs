@@ -66,7 +66,7 @@ struct InnerOptions {
 #[derive(Debug)]
 struct Inner {
     options: InnerOptions,
-    connection: Option<Connection>,
+    connection: Connection,
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
     peer_decode_manager: PeerDecodeManager,
@@ -104,7 +104,7 @@ impl VideoCallClient {
                 userid: options.userid.clone(),
                 on_peer_added: options.on_peer_added.clone(),
             },
-            connection: None,
+            connection: Connection::new(),
             aes: aes.clone(),
             rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
             peer_decode_manager: Self::create_peer_decoder_manager(&options),
@@ -157,8 +157,11 @@ impl VideoCallClient {
                 let callback = self.options.on_connected.clone();
                 Callback::from(move |_| {
                     if let Some(inner) = Weak::upgrade(&inner) {
-                        match inner.try_borrow() {
-                            Ok(inner) => inner.send_public_key(),
+                        match inner.try_borrow_mut() {
+                            Ok(mut inner) => {
+                                inner.send_public_key();
+                                inner.connection = inner.connection.complate_connection();
+                            }
                             Err(_) => {
                                 error!("Unable to borrow inner -- not sending public key");
                             }
@@ -167,7 +170,23 @@ impl VideoCallClient {
                     callback.emit(());
                 })
             },
-            on_connection_lost: self.options.on_connection_lost.clone(),
+            on_connection_lost: {
+                let inner = Rc::downgrade(&self.inner);
+                let callback = self.options.on_connection_lost.clone();
+                Callback::from(move |_| {
+                    if let Some(inner) = Weak::upgrade(&inner) {
+                        match inner.try_borrow_mut() {
+                            Ok(mut inner) => {
+                                inner.connection = inner.connection.disconnect();
+                            }
+                            Err(_) => {
+                                error!("Unable to borrow inner -- not sending public key");
+                            }
+                        }
+                    }
+                    callback.emit(());
+                })
+            },
             peer_monitor: {
                 let inner = Rc::downgrade(&self.inner);
                 let on_connection_lost = self.options.on_connection_lost.clone();
@@ -196,11 +215,11 @@ impl VideoCallClient {
         );
 
         let mut borrowed = self.inner.try_borrow_mut()?;
-        borrowed.connection.replace(Connection::connect(
+        borrowed.connection = borrowed.connection.connect(
             self.options.enable_webtransport,
             options,
             self.aes.clone(),
-        )?);
+        );
         Ok(())
     }
 
@@ -224,9 +243,7 @@ impl VideoCallClient {
     /// Returns `true` if the client is currently connected to a server.
     pub fn is_connected(&self) -> bool {
         if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(connection) = &inner.connection {
-                return connection.is_connected();
-            }
+            return inner.connection.is_connected();
         };
         false
     }
@@ -266,10 +283,8 @@ impl VideoCallClient {
 }
 
 impl Inner {
-    fn send_packet(&self, media: PacketWrapper) {
-        if let Some(connection) = &self.connection {
-            connection.send_packet(media);
-        }
+    fn send_packet(&self, packet: PacketWrapper) {
+        self.connection.send_packet(packet);
     }
 
     fn on_inbound_media(&mut self, response: PacketWrapper) {

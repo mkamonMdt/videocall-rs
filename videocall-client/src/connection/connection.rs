@@ -6,8 +6,8 @@ use super::task::Task;
 use super::ConnectOptions;
 use crate::crypto::aes::Aes128State;
 use gloo::timers::callback::Interval;
+use log::{error, info};
 use protobuf::Message;
-use std::cell::Cell;
 use std::rc::Rc;
 use types::protos::media_packet::media_packet::MediaType;
 use types::protos::media_packet::MediaPacket;
@@ -15,70 +15,95 @@ use types::protos::packet_wrapper::packet_wrapper::PacketType;
 use types::protos::packet_wrapper::PacketWrapper;
 use yew::prelude::Callback;
 
-#[derive(Clone, Copy, Debug)]
-enum Status {
-    Connecting,
-    Connected,
-    Closed,
+#[derive(Debug)]
+pub struct Connecting {
+    userid: String,
+    task: Rc<Task>,
+    aes: Rc<Aes128State>,
+    peer_monitor: Callback<()>,
 }
 
 #[derive(Debug)]
-pub struct Connection {
+pub struct Connected {
     task: Rc<Task>,
-    heartbeat: Option<Interval>,
-    heartbeat_monitor: Option<Interval>,
-    status: Rc<Cell<Status>>,
-    aes: Rc<Aes128State>,
+    _heartbeat: Interval,
+    _heartbeat_monitor: Interval,
+}
+
+#[derive(Debug)]
+pub struct Closed {}
+
+#[derive(Debug)]
+pub enum Connection {
+    Closed(Closed),
+    Connecting(Connecting),
+    Connected(Connected),
 }
 
 impl Connection {
+    pub fn new() -> Self {
+        Connection::Closed(Closed {})
+    }
+
     pub fn connect(
+        &self,
         webtransport: bool,
         options: ConnectOptions,
         aes: Rc<Aes128State>,
-    ) -> anyhow::Result<Self> {
-        let mut options = options;
-        let userid = options.userid.clone();
-        let status = Rc::new(Cell::new(Status::Connecting));
-        {
-            let status = Rc::clone(&status);
-            options.on_connected = tap_callback(
-                options.on_connected,
-                Callback::from(move |_| status.set(Status::Connected)),
-            );
+    ) -> Self {
+        match self {
+            Connection::Closed(_) => {
+                let userid = options.userid.clone();
+                let peer_monitor = options.peer_monitor.clone();
+                match Task::connect(webtransport, options) {
+                    Ok(task) => {
+                        let task = Rc::new(task);
+                        Connection::Connecting(Connecting {
+                            userid,
+                            task,
+                            aes,
+                            peer_monitor,
+                        })
+                    }
+                    Err(_) => Connection::Closed(Closed {}),
+                }
+            }
+            _ => {
+                error!("Unable to connect - terminating connection");
+                self.disconnect()
+            }
         }
-        {
-            let status = Rc::clone(&status);
-            options.on_connection_lost = tap_callback(
-                options.on_connection_lost,
-                Callback::from(move |_| status.set(Status::Closed)),
-            );
-        }
-        let monitor = options.peer_monitor.clone();
-        let mut connection = Self {
-            task: Rc::new(Task::connect(webtransport, options)?),
-            heartbeat: None,
-            heartbeat_monitor: Some(Interval::new(5000, move || {
-                monitor.emit(());
-            })),
-            status,
-            aes,
-        };
-        connection.start_heartbeat(userid);
+    }
 
-        Ok(connection)
+    pub fn complate_connection(&self) -> Self {
+        match self {
+            Connection::Connecting(state) => Connection::Connected(Connected::from(state)),
+            _ => {
+                error!("Unable to complate connection - not in Connecting state");
+                Connection::Closed(Closed {})
+            }
+        }
+    }
+
+    pub fn disconnect(&self) -> Self {
+        info!("Connection terminated");
+        Connection::new()
     }
 
     pub fn is_connected(&self) -> bool {
-        matches!(self.status.get(), Status::Connected)
+        matches!(self, Connection::Connected(_))
     }
 
-    fn start_heartbeat(&mut self, userid: String) {
-        let task = Rc::clone(&self.task);
-        let status = Rc::clone(&self.status);
-        let aes = Rc::clone(&self.aes);
+    pub fn send_packet(&self, packet: PacketWrapper) {
+        if let Connection::Connected(state) = self {
+            state.task.send_packet(packet);
+        }
+    }
+}
 
-        self.heartbeat = Some(Interval::new(1000, move || {
+impl Connected {
+    fn start_heartbeat(task: Rc<Task>, aes: Rc<Aes128State>, userid: String) -> Interval {
+        Interval::new(1000, move || {
             let packet = MediaPacket {
                 media_type: MediaType::HEARTBEAT.into(),
                 email: userid.clone(),
@@ -92,40 +117,21 @@ impl Connection {
                 packet_type: PacketType::MEDIA_MANDATORY.into(),
                 ..Default::default()
             };
-            if let Status::Connected = status.get() {
-                task.send_packet(packet);
-            }
-        }));
+
+            task.send_packet(packet);
+        })
     }
 
-    fn stop_heartbeat(&mut self) {
-        if let Some(heartbeat) = self.heartbeat.take() {
-            heartbeat.cancel();
-        }
-        if let Some(heartbeat_monitor) = self.heartbeat_monitor.take() {
-            heartbeat_monitor.cancel();
-        }
-    }
-
-    pub fn send_packet(&self, packet: PacketWrapper) {
-        if let Status::Connected = self.status.get() {
-            self.task.send_packet(packet);
+    fn from(val: &Connecting) -> Connected {
+        let task = Rc::clone(&val.task);
+        let aes = Rc::clone(&val.aes);
+        let peer_monitor = val.peer_monitor.clone();
+        Connected {
+            task: Rc::clone(&val.task),
+            _heartbeat: Self::start_heartbeat(task, aes, val.userid.clone()),
+            _heartbeat_monitor: Interval::new(5000, move || {
+                peer_monitor.emit(());
+            }),
         }
     }
-}
-
-impl Drop for Connection {
-    fn drop(&mut self) {
-        self.stop_heartbeat();
-    }
-}
-
-fn tap_callback<IN: 'static, OUT: 'static>(
-    callback: Callback<IN, OUT>,
-    tap: Callback<()>,
-) -> Callback<IN, OUT> {
-    Callback::from(move |arg| {
-        tap.emit(());
-        callback.emit(arg)
-    })
 }
