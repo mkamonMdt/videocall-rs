@@ -1,5 +1,9 @@
 use super::super::connection::{ConnectOptions, Connection};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
+use super::media_management_interface::{send_command, ManagementCommand};
+use super::peer_subscribtion_manager::PeerSubscribtionManager;
+use crate::client::peer_subscribtion_manager::Reason::AutoSubscribe;
+use crate::client::send_packet::SendPacket;
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use anyhow::{anyhow, Result};
@@ -70,6 +74,7 @@ struct Inner {
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
     peer_decode_manager: PeerDecodeManager,
+    peer_subscribtion_manager: PeerSubscribtionManager,
 }
 
 /// The client struct for a video call connection.
@@ -91,6 +96,20 @@ impl PartialEq for VideoCallClient {
     }
 }
 
+impl SendPacket for VideoCallClient {
+    fn send_packet(&self, packet: PacketWrapper) {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.send_packet(packet),
+            Err(_) => {
+                error!(
+                    "Unable to borrow inner -- dropping send packet {:?}",
+                    packet
+                )
+            }
+        }
+    }
+}
+
 impl VideoCallClient {
     /// Constructor for the client struct.
     ///
@@ -108,6 +127,10 @@ impl VideoCallClient {
             aes: aes.clone(),
             rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
             peer_decode_manager: Self::create_peer_decoder_manager(&options),
+            peer_subscribtion_manager: PeerSubscribtionManager::new(
+                options.userid.clone(),
+                aes.clone(),
+            ),
         }));
         Self {
             options,
@@ -194,7 +217,11 @@ impl VideoCallClient {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         match inner.try_borrow_mut() {
                             Ok(mut inner) => {
-                                inner.peer_decode_manager.run_peer_monitor();
+                                if let Some(peers) = inner.peer_decode_manager.run_peer_monitor() {
+                                    for peer in peers {
+                                        inner.peer_subscribtion_manager.unsubscribe(&peer);
+                                    }
+                                }
                                 on_connection_lost.emit(());
                             }
                             Err(_) => {
@@ -229,15 +256,6 @@ impl VideoCallClient {
         peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
         peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
         peer_decode_manager
-    }
-
-    pub(crate) fn send_packet(&self, media: PacketWrapper) {
-        match self.inner.try_borrow() {
-            Ok(inner) => inner.send_packet(media),
-            Err(_) => {
-                error!("Unable to borrow inner -- dropping send packet {:?}", media)
-            }
-        }
     }
 
     /// Returns `true` if the client is currently connected to a server.
@@ -279,6 +297,15 @@ impl VideoCallClient {
     /// Returns a reference to a copy of [`options.userid`](VideoCallClientOptions::userid)
     pub fn userid(&self) -> &String {
         &self.options.userid
+    }
+
+    pub fn send_stream_notification(&self) {
+        send_command(
+            self,
+            &self.aes,
+            self.userid().clone(),
+            ManagementCommand::NotifyOngoinStream,
+        );
     }
 }
 
@@ -349,7 +376,23 @@ impl Inner {
                     }
                 }
             }
-            Ok(PacketType::MEDIA_OPTIONAL) | Ok(PacketType::MEDIA_MANDATORY) => {
+            Ok(PacketType::MEDIA_OPTIONAL) => {
+                let email = response.email.clone();
+                if !self.peer_subscribtion_manager.is_subscribed_to(&email) {
+                    send_command(
+                        &self.connection,
+                        &self.aes,
+                        self.options.userid.clone(),
+                        ManagementCommand::UnSubscribeFrom(email),
+                    );
+                    return;
+                }
+                if let Err(e) = self.peer_decode_manager.decode_media_packet(response) {
+                    error!("error decoding packet: {}", e.to_string());
+                    self.peer_decode_manager.delete_peer(&email);
+                }
+            }
+            Ok(PacketType::MEDIA_MANDATORY) => {
                 let email = response.email.clone();
                 if let Err(e) = self.peer_decode_manager.decode_media_packet(response) {
                     error!("error decoding packet: {}", e.to_string());
@@ -360,13 +403,17 @@ impl Inner {
                 error!("Not implemented: CONNECTION packet type");
             }
             Ok(PacketType::MEDIA_MANAGEMENT) => {
-                let email = response.email.clone();
-                if let Err(e) = self
+                match self
                     .peer_decode_manager
                     .decode_media_management_packet(response)
                 {
-                    error!("error decoding packet: {}", e.to_string());
-                    self.peer_decode_manager.delete_peer(&email);
+                    Ok(peer) => {
+                        self.peer_subscribtion_manager
+                            .subscribe(AutoSubscribe(peer.clone()), &self.connection);
+                    }
+                    Err(e) => {
+                        error!("error decoding packet: {}", e.to_string());
+                    }
                 }
             }
             Err(_) => {}

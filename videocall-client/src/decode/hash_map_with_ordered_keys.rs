@@ -75,7 +75,7 @@ impl<K: Ord + Hash + Clone, V> HashMapWithOrderedKeys<K, V> {
         &self.keys
     }
 
-    pub fn remove_if<F>(&mut self, predicate: F)
+    pub fn remove_if<F>(&mut self, predicate: F) -> Option<Vec<K>>
     where
         F: Fn(&mut V) -> bool,
     {
@@ -92,6 +92,12 @@ impl<K: Ord + Hash + Clone, V> HashMapWithOrderedKeys<K, V> {
         for key in &keys_to_remove {
             self.map.remove(key);
             self.keys.retain(|k| k != key);
+        }
+
+        if keys_to_remove.is_empty() {
+            Some(keys_to_remove)
+        } else {
+            None
         }
     }
 }

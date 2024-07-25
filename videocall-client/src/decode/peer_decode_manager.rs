@@ -217,9 +217,9 @@ impl PeerDecodeManager {
         self.connected_peers.get(key)
     }
 
-    pub fn run_peer_monitor(&mut self) {
+    pub fn run_peer_monitor(&mut self) -> Option<Vec<String>> {
         let pred = |peer: &mut Peer| peer.check_heartbeat();
-        self.connected_peers.remove_if(pred);
+        self.connected_peers.remove_if(pred)
     }
 
     pub fn decode_media_packet(&mut self, packet: PacketWrapper) -> Result<(), PeerDecodeError> {

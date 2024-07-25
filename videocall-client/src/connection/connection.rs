@@ -4,6 +4,7 @@
 ///
 use super::task::Task;
 use super::ConnectOptions;
+use crate::client::send_packet::SendPacket;
 use crate::crypto::aes::Aes128State;
 use gloo::timers::callback::Interval;
 use log::{error, info};
@@ -93,8 +94,10 @@ impl Connection {
     pub fn is_connected(&self) -> bool {
         matches!(self, Connection::Connected(_))
     }
+}
 
-    pub fn send_packet(&self, packet: PacketWrapper) {
+impl SendPacket for Connection {
+    fn send_packet(&self, packet: PacketWrapper) {
         if let Connection::Connected(state) = self {
             state.task.send_packet(packet);
         }

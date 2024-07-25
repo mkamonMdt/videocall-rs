@@ -1,3 +1,4 @@
+use gloo::timers::callback::Interval;
 use gloo_timers::callback::Timeout;
 use log::debug;
 use videocall_client::{CameraEncoder, MicrophoneEncoder, ScreenEncoder, VideoCallClient};
@@ -28,6 +29,7 @@ pub struct Host {
     pub share_screen: bool,
     pub mic_enabled: bool,
     pub video_enabled: bool,
+    notification: Option<Interval>,
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -44,6 +46,23 @@ pub struct MeetingProps {
     pub video_enabled: bool,
 }
 
+impl Host {
+    fn update_notification(&mut self, client: &VideoCallClient) {
+        if !self.has_ongoing_stream() {
+            let _ = self.notification.take();
+        } else if self.notification.is_none() {
+            let client = client.clone();
+            self.notification = Some(Interval::new(1000, move || {
+                client.send_stream_notification();
+            }));
+        }
+    }
+
+    fn has_ongoing_stream(&self) -> bool {
+        self.video_enabled || self.share_screen
+    }
+}
+
 impl Component for Host {
     type Message = Msg;
     type Properties = MeetingProps;
@@ -57,6 +76,7 @@ impl Component for Host {
             share_screen: ctx.props().share_screen,
             mic_enabled: ctx.props().mic_enabled,
             video_enabled: ctx.props().video_enabled,
+            notification: None,
         }
     }
 
@@ -87,6 +107,8 @@ impl Component for Host {
             self.video_enabled = ctx.props().video_enabled;
             ctx.link().send_message(Msg::DisableVideo)
         }
+
+        self.update_notification(&ctx.props().client);
 
         if first_render {
             ctx.link().send_message(Msg::Start);
